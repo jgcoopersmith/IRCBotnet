@@ -10,7 +10,8 @@ public static class BotCommands
 {
     public const string Auth   = "AUTH";   // args: pass
     public const string List   = "LIST";   // -> Bots
-    public const string Add    = "ADD";    // args: nick, host, port, channels(comma) -> Bots
+    public const string Add    = "ADD";    // args: id(optional), nick, host, port, channels(comma) -> Bots
+    public const string Edit   = "EDIT";   // args: id, nick, host, port, channels(comma) -> Bots
     public const string Remove = "REMOVE"; // args: id
     public const string Start  = "START";  // args: id
     public const string Stop   = "STOP";   // args: id

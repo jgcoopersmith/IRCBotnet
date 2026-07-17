@@ -33,16 +33,29 @@ dotnet run
 
 This opens the control panel. From there:
 
-1. Set the **Control Port** (default `6690`) and click **Launch Bot Host** — it
+1. Click **Add Bot…**, give it a nick, the IRC server host/port
+   (e.g. `localhost` / `6667`), and initial channels. **This works with no
+   host connection** — bots are stored in a local roster.
+2. **Edit…** (or double-click a row) to change a bot's nick/host/port/channels,
+   also offline.
+3. Set the **Control Port** (default `6690`) and click **Launch Bot Host** — it
    starts the host process and auto-connects. (Or start `IRCBotHost` yourself
-   and click **Connect**.)
-2. Click **Add Bot…**, give it a nick, the IRC server host/port
-   (e.g. `localhost` / `6667`), and initial channels.
-3. Select the bot and use **Start / Stop / Join / Part / Say / Remove**.
+   and click **Connect**.) On connect, your roster is synced to the host and any
+   bots already on the host are imported into your roster.
+4. Select a bot and use **Start / Stop / Join / Part / Say / Remove** (these
+   act on the running host, so they need a connection).
+
+### Offline roster
+
+The bot roster is owned by the front end and persisted to
+`%APPDATA%\IRCBot\bots.json`, so you can define and edit bots any time — no
+server or host required. Each bot has a stable id the host honours, so the
+roster syncs cleanly when you connect. Editing a **running** bot is rejected by
+the host; stop it first.
 
 The grid shows each bot's nick, server host, port, status (colour-coded:
-green = connected, orange = connecting, red = error, grey = stopped),
-channels, and last event. It auto-refreshes every 2 seconds.
+green = connected, orange = connecting, red = error, grey = stopped/offline),
+channels, and last event. It auto-refreshes every 2 seconds while connected.
 
 ## Run the bot host on its own
 

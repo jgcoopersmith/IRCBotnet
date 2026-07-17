@@ -10,11 +10,28 @@ public sealed class BotHost
 
     public IReadOnlyCollection<BotInfo> List() => _bots.Values.Select(b => b.ToInfo()).ToList();
 
-    public BotInfo Add(string nick, string host, int port, IEnumerable<string> channels)
+    // Create a bot, or update it if the id already exists (idempotent so the
+    // front end can push its local roster on connect). Returns (ok, message).
+    public (bool ok, string message) Upsert(string id, string nick, string host, int port, IEnumerable<string> channels)
     {
-        var bot = new IrcBot(nick, host, port, channels);
-        _bots[bot.Id] = bot;
-        return bot.ToInfo();
+        if (string.IsNullOrEmpty(id)) id = Guid.NewGuid().ToString("N")[..8];
+        if (_bots.TryGetValue(id, out var existing))
+        {
+            return existing.UpdateConfig(nick, host, port, channels)
+                ? (true, "Bot updated")
+                : (false, "Bot is running — stop it before editing");
+        }
+        _bots[id] = new IrcBot(id, nick, host, port, channels);
+        return (true, "Bot added");
+    }
+
+    // Edit an existing bot; fails if it doesn't exist.
+    public (bool ok, string message) Edit(string id, string nick, string host, int port, IEnumerable<string> channels)
+    {
+        if (!_bots.TryGetValue(id, out var bot)) return (false, "No such bot");
+        return bot.UpdateConfig(nick, host, port, channels)
+            ? (true, "Bot updated")
+            : (false, "Bot is running — stop it before editing");
     }
 
     public bool Remove(string id)

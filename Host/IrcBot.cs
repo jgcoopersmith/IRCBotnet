@@ -9,10 +9,10 @@ namespace IRCBot.Host;
 // send messages. All public methods are safe to call from the control thread.
 public sealed class IrcBot
 {
-    public string Id { get; } = Guid.NewGuid().ToString("N")[..8];
+    public string Id { get; }
     public string Nick { get; private set; }
-    public string Host { get; }
-    public int Port { get; }
+    public string Host { get; private set; }
+    public int Port { get; private set; }
 
     public BotStatus Status { get; private set; } = BotStatus.Stopped;
     public string LastEvent { get; private set; } = "created";
@@ -25,12 +25,30 @@ public sealed class IrcBot
     private StreamWriter? _writer;
     private CancellationTokenSource? _cts;
 
-    public IrcBot(string nick, string host, int port, IEnumerable<string> channels)
+    public IrcBot(string id, string nick, string host, int port, IEnumerable<string> channels)
     {
+        Id = id;
         Nick = nick;
         Host = host;
         Port = port;
         foreach (var c in channels) _channels.Add(Normalize(c));
+    }
+
+    // Update a bot's configuration. Only permitted while stopped, so a running
+    // connection is never mutated out from under itself.
+    public bool UpdateConfig(string nick, string host, int port, IEnumerable<string> channels)
+    {
+        lock (_lock)
+        {
+            if (Status is BotStatus.Connecting or BotStatus.Connected) return false;
+            Nick = nick;
+            Host = host;
+            Port = port;
+            _channels.Clear();
+            foreach (var c in channels) _channels.Add(Normalize(c));
+            LastEvent = "edited";
+            return true;
+        }
     }
 
     public BotInfo ToInfo()

@@ -76,8 +76,20 @@ public sealed class ControlInterface(BotHost host, int port, string? password)
                 var chost = req.Arg("host") is { Length: > 0 } h ? h : "localhost";
                 if (!int.TryParse(req.Arg("port"), out var port)) port = 6667;
                 var channels = req.Arg("channels").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-                host.Add(nick, chost, port, channels);
-                return new BotResponse { Ok = true, Message = $"Added bot {nick}", Bots = host.List().ToList() };
+                var (ok, msg) = host.Upsert(req.Arg("id"), nick, chost, port, channels);
+                return new BotResponse { Ok = ok, Message = ok ? msg : null, Error = ok ? null : msg, Bots = host.List().ToList() };
+            }
+
+            case BotCommands.Edit:
+            {
+                var id = req.Arg("id");
+                var nick = req.Arg("nick");
+                if (string.IsNullOrWhiteSpace(nick)) return Fail("Nick required");
+                var chost = req.Arg("host") is { Length: > 0 } h ? h : "localhost";
+                if (!int.TryParse(req.Arg("port"), out var port)) port = 6667;
+                var channels = req.Arg("channels").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                var (ok, msg) = host.Edit(id, nick, chost, port, channels);
+                return new BotResponse { Ok = ok, Message = ok ? msg : null, Error = ok ? null : msg, Bots = host.List().ToList() };
             }
 
             case BotCommands.Remove:

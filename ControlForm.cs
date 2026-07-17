@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text.Json;
 using IRCBot.Shared;
 
 namespace IRCBot.ControlApp;
@@ -6,6 +7,13 @@ namespace IRCBot.ControlApp;
 public sealed class ControlForm : Form
 {
     private readonly BotControlClient _client = new();
+
+    // Local, persisted roster of bot definitions. This is the source of truth
+    // for identity, so bots can be added/edited with no host connection and
+    // synced to the host when one is available.
+    private readonly List<BotDef> _roster = new();
+    private static string RosterPath =>
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "IRCBot", "bots.json");
 
     // Bot host process controls
     private readonly TextBox _hostPort = new() { Text = "6690", Width = 55 };
@@ -47,17 +55,22 @@ public sealed class ControlForm : Form
         _botsView.Columns.Add("Server Host", 110);
         _botsView.Columns.Add("Port", 55);
         _botsView.Columns.Add("Status", 90);
-        _botsView.Columns.Add("Channels", 220);
-        _botsView.Columns.Add("Last Event", 160);
+        _botsView.Columns.Add("Channels", 210);
+        _botsView.Columns.Add("Last Event", 150);
         _botsView.Columns.Add("Id", 70);
 
         BuildLayout();
+        LoadRoster();
 
         _launchBtn.Click += async (_, _) => await ToggleHostAsync();
         _connectBtn.Click += async (_, _) => await ToggleConnectAsync();
         _autoRefresh.CheckedChanged += (_, _) => { if (_client.IsConnected && _autoRefresh.Checked) _timer.Start(); else _timer.Stop(); };
         _timer.Tick += async (_, _) => await RefreshAsync();
+        _botsView.DoubleClick += async (_, _) => await EditBotAsync();
         FormClosing += (_, _) => { _timer.Stop(); _client.Dispose(); StopHost(); };
+
+        RenderGrid(new());
+        Log($"Roster loaded from {RosterPath} ({_roster.Count} bot(s)). Add/edit works offline.");
     }
 
     private void BuildLayout()
@@ -87,6 +100,7 @@ public sealed class ControlForm : Form
         var botsPanel = new Panel { Dock = DockStyle.Fill };
         var actions = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 36 };
         AddButton(actions, "Add Bot…", async () => await AddBotAsync());
+        AddButton(actions, "Edit…", async () => await EditBotAsync());
         AddButton(actions, "Start", async () => await BotAction(BotCommands.Start));
         AddButton(actions, "Stop", async () => await BotAction(BotCommands.Stop));
         AddButton(actions, "Join…", async () => await JoinPartAsync(BotCommands.Join));
@@ -102,6 +116,28 @@ public sealed class ControlForm : Form
 
         Controls.Add(split);
         Controls.Add(bar);
+    }
+
+    // ── Roster persistence ──────────────────────────────────────────────
+    private void LoadRoster()
+    {
+        try
+        {
+            if (!File.Exists(RosterPath)) return;
+            var defs = JsonSerializer.Deserialize<List<BotDef>>(File.ReadAllText(RosterPath));
+            if (defs != null) { _roster.Clear(); _roster.AddRange(defs); }
+        }
+        catch (Exception ex) { Log($"Could not load roster: {ex.Message}"); }
+    }
+
+    private void SaveRoster()
+    {
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(RosterPath)!);
+            File.WriteAllText(RosterPath, JsonSerializer.Serialize(_roster, new JsonSerializerOptions { WriteIndented = true }));
+        }
+        catch (Exception ex) { Log($"Could not save roster: {ex.Message}"); }
     }
 
     // ── Bot host process ────────────────────────────────────────────────
@@ -203,6 +239,7 @@ public sealed class ControlForm : Form
         {
             _timer.Stop(); _client.Dispose();
             SetStatus("Disconnected", false); _connectBtn.Text = "Connect";
+            RenderGrid(new());
             return;
         }
         await ConnectAsync();
@@ -217,6 +254,7 @@ public sealed class ControlForm : Form
             SetStatus($"Connected to {_host.Text}:{port}", true);
             _connectBtn.Text = "Disconnect";
             Log($"Connected to control port {_host.Text}:{port}");
+            await SyncWithHostAsync();
             if (_autoRefresh.Checked) _timer.Start();
             await RefreshAsync();
             return true;
@@ -229,37 +267,73 @@ public sealed class ControlForm : Form
         }
     }
 
-    // ── Refresh ─────────────────────────────────────────────────────────
-    private async Task RefreshAsync()
+    // Push local defs the host doesn't have, and import host bots we don't know.
+    private async Task SyncWithHostAsync()
     {
-        if (!_client.IsConnected) return;
         try
         {
             var r = await _client.SimpleAsync(BotCommands.List);
-            if (r.Bots is not { } bots) return;
-            var selected = SelectedId();
-            _botsView.BeginUpdate();
-            _botsView.Items.Clear();
-            foreach (var b in bots.OrderBy(b => b.Nick))
-            {
-                var item = new ListViewItem(new[]
+            var hostBots = r.Bots ?? new();
+            var hostIds = hostBots.Select(b => b.Id).ToHashSet();
+
+            foreach (var d in _roster.ToList())
+                if (!hostIds.Contains(d.Id))
+                    await _client.ActionAsync(BotCommands.Add, d.ToArgs());
+
+            bool imported = false;
+            foreach (var b in hostBots)
+                if (_roster.All(d => d.Id != b.Id))
                 {
-                    b.Nick, b.Host, b.Port.ToString(), b.Status.ToString(),
-                    string.Join(", ", b.Channels), b.LastEvent, b.Id
-                });
-                item.ForeColor = b.Status switch
-                {
-                    BotStatus.Connected => Color.ForestGreen,
-                    BotStatus.Connecting => Color.DarkOrange,
-                    BotStatus.Error => Color.Firebrick,
-                    _ => Color.DimGray
-                };
-                _botsView.Items.Add(item);
-                if (b.Id == selected) item.Selected = true;
-            }
-            _botsView.EndUpdate();
+                    _roster.Add(BotDef.FromInfo(b));
+                    imported = true;
+                }
+            if (imported) SaveRoster();
+            Log($"Synced roster with host ({_roster.Count} bot(s)).");
         }
-        catch (Exception ex) { Log($"Refresh error: {ex.Message}"); }
+        catch (Exception ex) { Log($"Sync error: {ex.Message}"); }
+    }
+
+    // ── Refresh / render ────────────────────────────────────────────────
+    private async Task RefreshAsync()
+    {
+        Dictionary<string, BotInfo> live = new();
+        if (_client.IsConnected)
+        {
+            try
+            {
+                var r = await _client.SimpleAsync(BotCommands.List);
+                if (r.Bots != null) live = r.Bots.ToDictionary(b => b.Id);
+            }
+            catch (Exception ex) { Log($"Refresh error: {ex.Message}"); }
+        }
+        RenderGrid(live);
+    }
+
+    private void RenderGrid(Dictionary<string, BotInfo> live)
+    {
+        var selected = SelectedId();
+        _botsView.BeginUpdate();
+        _botsView.Items.Clear();
+        foreach (var d in _roster.OrderBy(d => d.Nick, StringComparer.OrdinalIgnoreCase))
+        {
+            live.TryGetValue(d.Id, out var info);
+            var status = info?.Status.ToString() ?? (_client.IsConnected ? "Not on host" : "Offline");
+            var channels = info != null ? string.Join(", ", info.Channels) : string.Join(", ", d.Channels);
+            var item = new ListViewItem(new[]
+            {
+                d.Nick, d.Host, d.Port.ToString(), status, channels, info?.LastEvent ?? "", d.Id
+            });
+            item.ForeColor = info?.Status switch
+            {
+                BotStatus.Connected => Color.ForestGreen,
+                BotStatus.Connecting => Color.DarkOrange,
+                BotStatus.Error => Color.Firebrick,
+                _ => Color.DimGray
+            };
+            _botsView.Items.Add(item);
+            if (d.Id == selected) item.Selected = true;
+        }
+        _botsView.EndUpdate();
     }
 
     // ── Bot actions ─────────────────────────────────────────────────────
@@ -278,22 +352,66 @@ public sealed class ControlForm : Form
     {
         var id = SelectedId();
         if (id == null) { Warn("Select a bot"); return; }
+        if (!_client.IsConnected) { Warn("Connect to a bot host to start/stop bots"); return; }
         await RunAction(_client.ActionAsync(cmd, ("id", id)));
     }
 
+    // Add works offline: writes to the local roster, and pushes to the host if connected.
     private async Task AddBotAsync()
     {
-        if (!_client.IsConnected) { Warn("Connect to a bot host first"); return; }
-        using var dlg = new AddBotDialog();
+        using var dlg = new AddBotDialog("Add Bot");
         if (dlg.ShowDialog(this) != DialogResult.OK) return;
-        await RunAction(_client.ActionAsync(BotCommands.Add,
-            ("nick", dlg.Nick), ("host", dlg.HostName), ("port", dlg.Port), ("channels", dlg.Channels)));
+        if (string.IsNullOrWhiteSpace(dlg.Nick)) { Warn("Nick is required"); return; }
+
+        var def = new BotDef
+        {
+            Id = Guid.NewGuid().ToString("N")[..8],
+            Nick = dlg.Nick,
+            Host = dlg.HostName,
+            Port = int.TryParse(dlg.Port, out var p) ? p : 6667,
+            Channels = SplitChannels(dlg.Channels)
+        };
+        _roster.Add(def);
+        SaveRoster();
+        Log($"Added bot {def.Nick} (local roster).");
+
+        if (_client.IsConnected)
+            await RunAction(_client.ActionAsync(BotCommands.Add, def.ToArgs()));
+        else
+            RenderGrid(new());
+    }
+
+    // Edit works offline too. If connected and the bot is running, the host
+    // rejects the edit and asks you to stop it first.
+    private async Task EditBotAsync()
+    {
+        var id = SelectedId();
+        if (id == null) { Warn("Select a bot"); return; }
+        var def = _roster.FirstOrDefault(d => d.Id == id);
+        if (def == null) return;
+
+        using var dlg = new AddBotDialog("Edit Bot", def.Nick, def.Host, def.Port.ToString(), string.Join(", ", def.Channels));
+        if (dlg.ShowDialog(this) != DialogResult.OK) return;
+        if (string.IsNullOrWhiteSpace(dlg.Nick)) { Warn("Nick is required"); return; }
+
+        def.Nick = dlg.Nick;
+        def.Host = dlg.HostName;
+        def.Port = int.TryParse(dlg.Port, out var p) ? p : 6667;
+        def.Channels = SplitChannels(dlg.Channels);
+        SaveRoster();
+        Log($"Edited bot {def.Nick} (local roster).");
+
+        if (_client.IsConnected)
+            await RunAction(_client.ActionAsync(BotCommands.Edit, def.ToArgs()));
+        else
+            RenderGrid(new());
     }
 
     private async Task JoinPartAsync(string cmd)
     {
         var id = SelectedId();
         if (id == null) { Warn("Select a bot"); return; }
+        if (!_client.IsConnected) { Warn("Connect to a bot host to join/part channels"); return; }
         var channel = Prompt($"{cmd} channel (e.g. #test):", "#test");
         if (string.IsNullOrWhiteSpace(channel)) return;
         await RunAction(_client.ActionAsync(cmd, ("id", id), ("channel", channel)));
@@ -303,6 +421,7 @@ public sealed class ControlForm : Form
     {
         var id = SelectedId();
         if (id == null) { Warn("Select a bot"); return; }
+        if (!_client.IsConnected) { Warn("Connect to a bot host to send messages"); return; }
         var target = Prompt("Target (channel or nick):", "#test");
         if (string.IsNullOrWhiteSpace(target)) return;
         var text = Prompt("Message:", "");
@@ -310,14 +429,25 @@ public sealed class ControlForm : Form
         await RunAction(_client.ActionAsync(BotCommands.Say, ("id", id), ("target", target), ("text", text)));
     }
 
+    // Remove works offline: drops from the roster, and from the host if connected.
     private async Task RemoveBotAsync()
     {
         var id = SelectedId();
         if (id == null) { Warn("Select a bot"); return; }
-        await RunAction(_client.ActionAsync(BotCommands.Remove, ("id", id)));
+        _roster.RemoveAll(d => d.Id == id);
+        SaveRoster();
+        Log("Removed bot (local roster).");
+
+        if (_client.IsConnected)
+            await RunAction(_client.ActionAsync(BotCommands.Remove, ("id", id)));
+        else
+            RenderGrid(new());
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────
+    private static List<string> SplitChannels(string csv) =>
+        csv.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
+
     private string? SelectedId() =>
         _botsView.SelectedItems.Count == 0 ? null : _botsView.SelectedItems[0].SubItems[6].Text;
 
@@ -362,29 +492,52 @@ public sealed class ControlForm : Form
     }
 }
 
-// Dialog for creating a bot: nick, server host, port, initial channels.
+// A persisted bot definition owned by the front end.
+public sealed class BotDef
+{
+    public string Id { get; set; } = "";
+    public string Nick { get; set; } = "";
+    public string Host { get; set; } = "localhost";
+    public int Port { get; set; } = 6667;
+    public List<string> Channels { get; set; } = new();
+
+    public (string, string)[] ToArgs() => new[]
+    {
+        ("id", Id), ("nick", Nick), ("host", Host),
+        ("port", Port.ToString()), ("channels", string.Join(",", Channels))
+    };
+
+    public static BotDef FromInfo(BotInfo b) => new()
+    {
+        Id = b.Id, Nick = b.Nick, Host = b.Host, Port = b.Port, Channels = b.Channels.ToList()
+    };
+}
+
+// Dialog for creating or editing a bot: nick, server host, port, channels.
 public sealed class AddBotDialog : Form
 {
-    private readonly TextBox _nick = new() { Left = 130, Top = 12, Width = 260, Text = "MyBot" };
-    private readonly TextBox _host = new() { Left = 130, Top = 44, Width = 260, Text = "localhost" };
-    private readonly TextBox _port = new() { Left = 130, Top = 76, Width = 260, Text = "6667" };
-    private readonly TextBox _channels = new() { Left = 130, Top = 108, Width = 260, Text = "#test" };
+    private readonly TextBox _nick = new() { Left = 130, Top = 12, Width = 260 };
+    private readonly TextBox _host = new() { Left = 130, Top = 44, Width = 260 };
+    private readonly TextBox _port = new() { Left = 130, Top = 76, Width = 260 };
+    private readonly TextBox _channels = new() { Left = 130, Top = 108, Width = 260 };
 
     public string Nick => _nick.Text.Trim();
     public string HostName => _host.Text.Trim();
     public string Port => _port.Text.Trim();
     public string Channels => _channels.Text.Trim();
 
-    public AddBotDialog()
+    public AddBotDialog(string title = "Add Bot", string nick = "MyBot", string host = "localhost", string port = "6667", string channels = "#test")
     {
-        Text = "Add Bot";
+        Text = title;
         Width = 420; Height = 210;
         FormBorderStyle = FormBorderStyle.FixedDialog;
         StartPosition = FormStartPosition.CenterParent;
         MaximizeBox = false; MinimizeBox = false;
 
+        _nick.Text = nick; _host.Text = host; _port.Text = port; _channels.Text = channels;
+
         Label L(string t, int top) => new() { Text = t, Left = 12, Top = top + 3, Width = 115 };
-        var ok = new Button { Text = "Add", DialogResult = DialogResult.OK, Left = 234, Top = 140, Width = 75 };
+        var ok = new Button { Text = "Save", DialogResult = DialogResult.OK, Left = 234, Top = 140, Width = 75 };
         var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Left = 315, Top = 140, Width = 75 };
 
         Controls.AddRange(new Control[]
