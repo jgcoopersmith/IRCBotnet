@@ -78,14 +78,15 @@ public sealed class IrcBot
 
     public void Start()
     {
+        CancellationTokenSource cts;
         lock (_lock)
         {
             if (Status is BotStatus.Connecting or BotStatus.Connected) return;
             Status = BotStatus.Connecting;
             LastEvent = "connecting";
-            _cts = new CancellationTokenSource();
+            cts = _cts = new CancellationTokenSource();
         }
-        _ = RunAsync(_cts!.Token);
+        _ = RunAsync(cts);
     }
 
     public void Stop()
@@ -127,8 +128,9 @@ public sealed class IrcBot
         Send($"PRIVMSG {target} :{text}");
     }
 
-    private async Task RunAsync(CancellationToken ct)
+    private async Task RunAsync(CancellationTokenSource cts)
     {
+        var ct = cts.Token;
         try
         {
             _tcp = new TcpClient();
@@ -167,14 +169,27 @@ public sealed class IrcBot
         catch (OperationCanceledException) { }
         catch (Exception ex)
         {
-            lock (_lock) { Status = BotStatus.Error; LastEvent = $"error: {ex.Message}"; ConnectedUtc = null; }
+            // Only report the failure if this is still the active run — a newer
+            // Start() may have superseded us after a rapid Stop/Start.
+            lock (_lock)
+            {
+                if (ReferenceEquals(_cts, cts))
+                {
+                    Status = BotStatus.Error;
+                    LastEvent = $"error: {ex.Message}";
+                    ConnectedUtc = null;
+                }
+            }
             return;
         }
 
         lock (_lock)
         {
-            if (Status != BotStatus.Stopped) { Status = BotStatus.Stopped; LastEvent = "disconnected"; }
-            ConnectedUtc = null;
+            if (ReferenceEquals(_cts, cts))
+            {
+                if (Status != BotStatus.Stopped) { Status = BotStatus.Stopped; LastEvent = "disconnected"; }
+                ConnectedUtc = null;
+            }
         }
     }
 
