@@ -124,8 +124,7 @@ public sealed class ControlForm : Form
         _mainSplit = new SplitContainer
         {
             Dock = DockStyle.Fill, Orientation = Orientation.Horizontal,
-            SplitterWidth = 6, Panel1MinSize = 120, Panel2MinSize = 100,
-            BackColor = SystemColors.ControlDark
+            SplitterWidth = 6, Panel1MinSize = 120, Panel2MinSize = 150
         };
         var split = _mainSplit;
 
@@ -163,8 +162,7 @@ public sealed class ControlForm : Form
         _logSplit = new SplitContainer
         {
             Dock = DockStyle.Fill, Orientation = Orientation.Horizontal,
-            SplitterWidth = 6, Panel1MinSize = 60, Panel2MinSize = 60,
-            BackColor = SystemColors.ControlDark
+            SplitterWidth = 6, Panel1MinSize = 60, Panel2MinSize = 60
         };
         _logSplit.Panel1.Controls.Add(WithHeader(_log, "Activity log"));
         _logSplit.Panel2.Controls.Add(WithHeader(_botLog, "Bot connection activity"));
