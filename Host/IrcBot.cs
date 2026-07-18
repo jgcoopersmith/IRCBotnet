@@ -169,6 +169,17 @@ public sealed class IrcBot
         return true;
     }
 
+    // Kick a nick from a channel. Requires operator status. False if not connected.
+    public bool Kick(string channel, string nick, string reason)
+    {
+        bool connected;
+        lock (_lock) connected = Status == BotStatus.Connected;
+        if (!connected) return false;
+        Event($"KICK {nick} from {channel}");
+        Send(string.IsNullOrEmpty(reason) ? $"KICK {channel} {nick}" : $"KICK {channel} {nick} :{reason}");
+        return true;
+    }
+
     // Ask the server for the channel's ban list (populates the cache via 367/368).
     public bool RequestBanList(string channel)
     {

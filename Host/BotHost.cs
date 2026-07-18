@@ -51,6 +51,7 @@ public sealed class BotHost
     public bool? Part(string id, string channel) => WithResult(id, b => b.Part(channel));
     public bool? Say(string id, string target, string text) => WithResult(id, b => b.Say(target, text));
     public bool? Mode(string id, string channel, string modes) => WithResult(id, b => b.Mode(channel, modes));
+    public bool? Kick(string id, string channel, string nick, string reason) => WithResult(id, b => b.Kick(channel, nick, reason));
 
     // Return the bot's cached ban list for a channel and trigger a fresh fetch.
     public (bool ok, List<ChannelBan> bans) BanList(string id, string channel)

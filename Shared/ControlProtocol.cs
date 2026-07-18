@@ -19,6 +19,7 @@ public static class BotCommands
     public const string Part   = "PART";   // args: id, channel
     public const string Say    = "SAY";    // args: id, target, text
     public const string Mode    = "MODE";    // args: id, channel, modes (e.g. "+o nick", "+m")
+    public const string Kick    = "KICK";    // args: id, channel, nick, reason
     public const string BanList = "BANLIST"; // args: id, channel -> ChannelBans (and refreshes cache)
     public const string Events  = "EVENTS";  // args: since (cursor) -> Events, Cursor
 }

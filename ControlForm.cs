@@ -151,6 +151,7 @@ public sealed class ControlForm : Form
         AddButton(actions, "Deop", async () => await MemberModeAsync("-o"));
         AddButton(actions, "Voice", async () => await MemberModeAsync("+v"));
         AddButton(actions, "Devoice", async () => await MemberModeAsync("-v"));
+        AddButton(actions, "Kick…", async () => await KickAsync());
         AddButton(actions, "Bans…", async () => await ManageBansAsync());
 
         botsPanel.Controls.Add(_botsView);
@@ -541,6 +542,21 @@ public sealed class ControlForm : Form
         var nick = Prompt($"Nick to {flag}:", "");
         if (string.IsNullOrWhiteSpace(nick)) return;
         await RunAction(_client.ActionAsync(BotCommands.Mode, ("id", id), ("channel", ch), ("modes", $"{flag} {nick}")));
+    }
+
+    // Kick a nick from a channel, issued across the checked bots (or the row).
+    private async Task KickAsync()
+    {
+        var ids = TargetIds();
+        if (ids.Count == 0) { Warn("Check one or more bots, or select a row"); return; }
+        if (!_client.IsConnected) { Warn("Connect to a bot host first"); return; }
+        var channel = Prompt("Channel:", "#test");
+        if (string.IsNullOrWhiteSpace(channel)) return;
+        var nick = Prompt("Nick to kick:", "");
+        if (string.IsNullOrWhiteSpace(nick)) return;
+        var reason = Prompt("Reason (optional):", "Kicked");
+        if (reason == null) return;
+        await RunBatch(BotCommands.Kick, ("channel", channel), ("nick", nick), ("reason", reason));
     }
 
     // View / add / remove channel bans through one bot's eyes.

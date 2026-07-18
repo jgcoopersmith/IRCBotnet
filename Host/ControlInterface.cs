@@ -131,6 +131,12 @@ public sealed class ControlInterface(BotHost host, int port, string? password)
                 return res is null ? Fail("No such bot")
                      : res.Value ? Ok("Mode sent") : Fail("Bot is not connected");
             }
+            case BotCommands.Kick:
+            {
+                var res = host.Kick(req.Arg("id"), req.Arg("channel"), req.Arg("nick"), req.Arg("reason"));
+                return res is null ? Fail("No such bot")
+                     : res.Value ? Ok($"Kicked {req.Arg("nick")}") : Fail("Bot is not connected");
+            }
 
             case BotCommands.BanList:
             {
