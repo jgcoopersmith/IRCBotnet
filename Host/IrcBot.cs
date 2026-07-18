@@ -362,6 +362,21 @@ public sealed class IrcBot
         }
         else if (cmd == "353") HandleNames(body);   // RPL_NAMREPLY → learn our own prefix
         else if (cmd == "MODE") HandleModeLine(body); // track op/voice changes to us
+        else if (cmd == "KICK") HandleKickLine(body); // leave a channel we were kicked from
+    }
+
+    // "KICK <channel> <target> [:<reason>]" — if we're the target, leave the channel.
+    private void HandleKickLine(string body)
+    {
+        var parts = body.Split(' ', 4);
+        if (parts.Length < 3) return;
+        var chan = parts[1];
+        var target = parts[2];
+        if (!string.Equals(target, Nick, StringComparison.OrdinalIgnoreCase)) return;
+
+        lock (_lock) { _channels.Remove(chan); _channelPrefix.Remove(chan); }
+        var reason = parts.Length > 3 ? parts[3].TrimStart(':') : "";
+        Event($"kicked from {chan}" + (reason.Length > 0 ? $" ({reason})" : ""));
     }
 
     // RPL_NAMREPLY: "353 <me> = <channel> :<prefixed nicks>" — find our own prefix.
