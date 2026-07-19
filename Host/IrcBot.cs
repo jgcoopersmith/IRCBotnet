@@ -165,40 +165,44 @@ public sealed class IrcBot
     // modes). Requires operator status on the channel. Returns false if not connected.
     public bool Mode(string channel, string modes)
     {
+        var ch = Normalize(channel);
         bool connected;
         lock (_lock) connected = Status == BotStatus.Connected;
         if (!connected) return false;
-        Event($"MODE {channel} {modes}");
-        Send($"MODE {channel} {modes}");
+        Event($"MODE {ch} {modes}");
+        Send($"MODE {ch} {modes}");
         return true;
     }
 
     // Kick a nick from a channel. Requires operator status. False if not connected.
     public bool Kick(string channel, string nick, string reason)
     {
+        var ch = Normalize(channel);
         bool connected;
         lock (_lock) connected = Status == BotStatus.Connected;
         if (!connected) return false;
-        Event($"KICK {nick} from {channel}");
-        Send(string.IsNullOrEmpty(reason) ? $"KICK {channel} {nick}" : $"KICK {channel} {nick} :{reason}");
+        Event($"KICK {nick} from {ch}");
+        Send(string.IsNullOrEmpty(reason) ? $"KICK {ch} {nick}" : $"KICK {ch} {nick} :{reason}");
         return true;
     }
 
     // Ask the server for the channel's ban list (populates the cache via 367/368).
     public bool RequestBanList(string channel)
     {
+        var ch = Normalize(channel);
         bool connected;
-        lock (_lock) { connected = Status == BotStatus.Connected; _banBuilding[channel] = new(); }
+        lock (_lock) { connected = Status == BotStatus.Connected; _banBuilding[ch] = new(); }
         if (!connected) return false;
-        Event($"requesting ban list for {channel}");
-        Send($"MODE {channel} +b");
+        Event($"requesting ban list for {ch}");
+        Send($"MODE {ch} +b");
         return true;
     }
 
     public List<ChannelBan> GetBans(string channel)
     {
+        var ch = Normalize(channel);
         lock (_lock)
-            return _banCache.TryGetValue(channel, out var l) ? new List<ChannelBan>(l) : new();
+            return _banCache.TryGetValue(ch, out var l) ? new List<ChannelBan>(l) : new();
     }
 
     private async Task RunAsync(CancellationTokenSource cts)
@@ -363,6 +367,29 @@ public sealed class IrcBot
         else if (cmd == "353") HandleNames(body);   // RPL_NAMREPLY → learn our own prefix
         else if (cmd == "MODE") HandleModeLine(body); // track op/voice changes to us
         else if (cmd == "KICK") HandleKickLine(body); // leave a channel we were kicked from
+        // Error replies occupy 400–599. A rejected MODE or KICK is only ever
+        // reported this way, so surface it rather than dropping it silently.
+        else if (int.TryParse(cmd, out var numeric) && numeric is >= 400 and <= 599)
+            HandleErrorNumeric(cmd, body);
+    }
+
+    // "<numeric> <me> [<context>…] :<message>" — e.g.
+    // "482 opbot #kungfu :You're not channel operator"
+    private void HandleErrorNumeric(string numeric, string body)
+    {
+        var text = "";
+        int colon = body.IndexOf(" :", StringComparison.Ordinal);
+        if (colon >= 0) text = body[(colon + 2)..];
+
+        // Tokens between our own nick and the trailing message name what was
+        // rejected (a channel, a nick), which is the useful part.
+        var head = (colon >= 0 ? body[..colon] : body)
+            .Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        var context = head.Length > 2 ? string.Join(" ", head.Skip(2)) : "";
+
+        Event($"server error {numeric}"
+              + (context.Length > 0 ? $" ({context})" : "")
+              + (text.Length > 0 ? $": {text}" : ""));
     }
 
     // "KICK <channel> <target> [:<reason>]" — if we're the target, leave the channel.

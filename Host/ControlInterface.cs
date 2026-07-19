@@ -125,17 +125,20 @@ public sealed class ControlInterface(BotHost host, int port, string? password)
                 return res is null ? Fail("No such bot")
                      : res.Value ? Ok("Sent") : Fail("Bot is not connected");
             }
+            // MODE and KICK are fire-and-forget: the server only answers when it
+            // refuses. "Ok" here means the command left the bot, not that it took
+            // effect — any rejection shows up in the bot activity log.
             case BotCommands.Mode:
             {
                 var res = host.Mode(req.Arg("id"), req.Arg("channel"), req.Arg("modes"));
                 return res is null ? Fail("No such bot")
-                     : res.Value ? Ok("Mode sent") : Fail("Bot is not connected");
+                     : res.Value ? Ok("MODE sent (unconfirmed — check bot activity)") : Fail("Bot is not connected");
             }
             case BotCommands.Kick:
             {
                 var res = host.Kick(req.Arg("id"), req.Arg("channel"), req.Arg("nick"), req.Arg("reason"));
                 return res is null ? Fail("No such bot")
-                     : res.Value ? Ok($"Kicked {req.Arg("nick")}") : Fail("Bot is not connected");
+                     : res.Value ? Ok($"KICK {req.Arg("nick")} sent (unconfirmed — check bot activity)") : Fail("Bot is not connected");
             }
 
             case BotCommands.BanList:
