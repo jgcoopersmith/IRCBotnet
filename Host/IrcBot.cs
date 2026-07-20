@@ -33,6 +33,9 @@ public sealed class IrcBot
     // Channels for which a WHO was issued to enforce the auto list, so unrelated
     // WHO replies are ignored.
     private readonly HashSet<string> _autoWhoPending = new(StringComparer.OrdinalIgnoreCase);
+    // Everyone in each channel and their status ("@" op, "+" voice, "" none), so
+    // a rule is only acted on when it would actually change something.
+    private readonly Dictionary<string, Dictionary<string, string>> _members = new(StringComparer.OrdinalIgnoreCase);
     private readonly EventLog? _events;
     private readonly AutoRules? _auto;
 
@@ -125,7 +128,7 @@ public sealed class IrcBot
             w = _writer;
             Status = BotStatus.Stopped;
             ConnectedUtc = null;
-            _channelPrefix.Clear(); _autoWhoPending.Clear();
+            _channelPrefix.Clear(); _autoWhoPending.Clear(); _members.Clear();
         }
         Event("stopped");
         try { w?.WriteLine("QUIT :bye"); } catch { }
@@ -149,7 +152,7 @@ public sealed class IrcBot
     {
         var ch = Normalize(channel);
         bool connected;
-        lock (_lock) { _channels.Remove(ch); _channelPrefix.Remove(ch); connected = Status == BotStatus.Connected; }
+        lock (_lock) { _channels.Remove(ch); _channelPrefix.Remove(ch); _members.Remove(ch); connected = Status == BotStatus.Connected; }
         if (connected) { Event($"PART {ch}"); Send($"PART {ch}"); }
         else Event($"PART {ch} (de-queued, not connected)");
         return connected;
@@ -269,7 +272,7 @@ public sealed class IrcBot
             lock (_lock)
             {
                 owner = ReferenceEquals(_cts, cts);
-                if (owner) { Status = BotStatus.Error; ConnectedUtc = null; _channelPrefix.Clear(); _autoWhoPending.Clear(); }
+                if (owner) { Status = BotStatus.Error; ConnectedUtc = null; _channelPrefix.Clear(); _autoWhoPending.Clear(); _members.Clear(); }
             }
             if (owner) Event($"error: {ex.Message}");
         }
@@ -291,7 +294,7 @@ public sealed class IrcBot
             {
                 if (!wasStopped) Status = BotStatus.Stopped;
                 ConnectedUtc = null;
-                _channelPrefix.Clear(); _autoWhoPending.Clear();
+                _channelPrefix.Clear(); _autoWhoPending.Clear(); _members.Clear();
             }
         }
         if (stillOwner && !wasStopped) Event("disconnected");
@@ -377,6 +380,9 @@ public sealed class IrcBot
         else if (cmd == "MODE") HandleModeLine(body); // track op/voice changes to us
         else if (cmd == "KICK") HandleKickLine(body); // leave a channel we were kicked from
         else if (cmd == "JOIN") HandleJoinLine(sender, body); // enforce the auto list
+        else if (cmd == "PART") HandlePartLine(sender, body); // keep membership accurate
+        else if (cmd == "QUIT") ForgetMemberEverywhere(sender?.Split('!')[0] ?? "");
+        else if (cmd == "NICK") HandleNickLine(sender, body);
         else if (cmd == "352") HandleWhoReply(body);   // RPL_WHOREPLY → enforce on current members
         else if (cmd == "315") HandleEndOfWho(body);   // RPL_ENDOFWHO → stop enforcing this WHO
         // Error replies occupy 400–599. A rejected MODE or KICK is only ever
@@ -419,8 +425,9 @@ public sealed class IrcBot
         var whoFlags = p[7]; // e.g. "H", "H@", "G+"
         if (string.Equals(nick, Nick, StringComparison.OrdinalIgnoreCase)) return;
 
-        var current = whoFlags.Contains('@') ? "@" : whoFlags.Contains('+') ? "+" : "";
-        ApplyAuto(chan, nick, $"{nick}!{user}@{host}", current);
+        // WHO is authoritative for who holds what right now.
+        SetStatus(chan, nick, whoFlags.Contains('@') ? "@" : whoFlags.Contains('+') ? "+" : "");
+        ApplyAuto(chan, nick, $"{nick}!{user}@{host}");
     }
 
     // RPL_ENDOFWHO: "315 <me> <mask> :End of /WHO list."
@@ -445,13 +452,64 @@ public sealed class IrcBot
 
         var nick = sender.Split('!')[0];
         if (string.Equals(nick, Nick, StringComparison.OrdinalIgnoreCase)) return; // our own join
-        ApplyAuto(chan, nick, sender, "");
+        SetStatus(chan, nick, ""); // a joiner arrives with no status
+        ApplyAuto(chan, nick, sender);
     }
 
-    // Apply the auto list to one user. prefix is their nick!user@host; current
-    // is their existing channel status ("@", "+" or "") so we don't re-grant it.
-    // Only an opped bot may act. Kick wins over status, op over voice.
-    private void ApplyAuto(string chan, string nick, string prefix, string current)
+    // Membership bookkeeping. Callers already hold no lock; these take it.
+    private string StatusOf(string chan, string nick)
+    {
+        lock (_lock)
+            return _members.TryGetValue(chan, out var m) && m.TryGetValue(nick, out var s) ? s : "";
+    }
+
+    private void SetStatus(string chan, string nick, string status)
+    {
+        lock (_lock)
+        {
+            if (!_members.TryGetValue(chan, out var m))
+                m = _members[chan] = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            m[nick] = status;
+        }
+    }
+
+    private void ForgetMember(string chan, string nick)
+    {
+        lock (_lock) if (_members.TryGetValue(chan, out var m)) m.Remove(nick);
+    }
+
+    private void ForgetMemberEverywhere(string nick)
+    {
+        lock (_lock) foreach (var m in _members.Values) m.Remove(nick);
+    }
+
+    private void RenameMember(string oldNick, string newNick)
+    {
+        lock (_lock)
+            foreach (var m in _members.Values)
+                if (m.Remove(oldNick, out var status)) m[newNick] = status;
+    }
+
+    // ":<nick>!… PART <channel>" — drop them from the membership record.
+    private void HandlePartLine(string? sender, string body)
+    {
+        var parts = body.Split(' ', 3);
+        if (parts.Length < 2 || string.IsNullOrEmpty(sender)) return;
+        ForgetMember(parts[1].TrimStart(':').Trim(), sender.Split('!')[0]);
+    }
+
+    // ":<old>!… NICK :<new>" — carry their status across the rename.
+    private void HandleNickLine(string? sender, string body)
+    {
+        var parts = body.Split(' ', 2);
+        if (parts.Length < 2 || string.IsNullOrEmpty(sender)) return;
+        RenameMember(sender.Split('!')[0], parts[1].TrimStart(':').Trim());
+    }
+
+    // Apply the auto list to one user, but only where it would change something:
+    // an already-opped user is not re-opped, and an opped or voiced user is not
+    // re-voiced. Only an opped bot may act. Kick wins over status, op over voice.
+    private void ApplyAuto(string chan, string nick, string prefix)
     {
         if (_auto == null) return;
         bool isOp;
@@ -461,20 +519,27 @@ public sealed class IrcBot
         var flags = _auto.FlagsFor(prefix, chan);
         if (flags.Length == 0) return;
 
+        var current = StatusOf(chan, nick);
+
         if (flags.Contains('k'))
         {
             Event($"auto-kick {nick} from {chan}");
             Send($"KICK {chan} {nick} :auto-kick");
         }
-        else if (flags.Contains('o') && current != "@")
+        else if (flags.Contains('o'))
         {
+            if (current == "@") return; // already opped — nothing to do
             Event($"auto-op {nick} in {chan}");
             Send($"MODE {chan} +o {nick}");
+            // Assume it lands; a refusal or a later MODE corrects the record.
+            SetStatus(chan, nick, "@");
         }
-        else if (flags.Contains('v') && current != "@" && current != "+")
+        else if (flags.Contains('v'))
         {
+            if (current is "@" or "+") return; // already at or above voice
             Event($"auto-voice {nick} in {chan}");
             Send($"MODE {chan} +v {nick}");
+            SetStatus(chan, nick, "+");
         }
     }
 
@@ -524,9 +589,10 @@ public sealed class IrcBot
         if (parts.Length < 3) return;
         var chan = parts[1];
         var target = parts[2];
+        ForgetMember(chan, target);
         if (!string.Equals(target, Nick, StringComparison.OrdinalIgnoreCase)) return;
 
-        lock (_lock) { _channels.Remove(chan); _channelPrefix.Remove(chan); }
+        lock (_lock) { _channels.Remove(chan); _channelPrefix.Remove(chan); _members.Remove(chan); }
         var reason = parts.Length > 3 ? parts[3].TrimStart(':') : "";
         Event($"kicked from {chan}" + (reason.Length > 0 ? $" ({reason})" : ""));
     }
@@ -540,19 +606,22 @@ public sealed class IrcBot
         var chan = header.LastOrDefault(t => t.StartsWith('#') || t.StartsWith('&'));
         if (chan == null) return;
 
+        bool selfOpped = false;
         foreach (var entry in body[(colon + 1)..].Split(' ', StringSplitOptions.RemoveEmptyEntries))
         {
             var prefix = "";
             var name = entry;
             if (name.Length > 0 && (name[0] == '@' || name[0] == '+')) { prefix = name[0].ToString(); name = name[1..]; }
+            // Record everyone, so the auto list can tell what would actually change.
+            SetStatus(chan, name, prefix);
             if (string.Equals(name, Nick, StringComparison.OrdinalIgnoreCase))
             {
                 lock (_lock) if (_channels.Contains(chan)) _channelPrefix[chan] = prefix;
-                // Already opped on join → enforce the auto list on who's here.
-                if (prefix == "@") EnforceChannel(chan);
-                break;
+                selfOpped = prefix == "@";
             }
         }
+        // Already opped on join → enforce the auto list on who's here.
+        if (selfOpped) EnforceChannel(chan);
     }
 
     // Track channel MODE changes that op/deop/voice/devoice this bot.
@@ -572,7 +641,17 @@ public sealed class IrcBot
         {
             if (c is '+' or '-') { sign = c; continue; }
             string? param = (c is 'o' or 'v' or 'k' or 'l' or 'b') && argIdx < args.Length ? args[argIdx++] : null;
-            if ((c == 'o' || c == 'v') && param != null && string.Equals(param, Nick, StringComparison.OrdinalIgnoreCase))
+            if ((c != 'o' && c != 'v') || param == null) continue;
+
+            // Track the change for whoever it names, so the auto list knows this
+            // user already holds the status and does not re-apply it.
+            var was = StatusOf(chan, param);
+            var now = sign == '+'
+                ? (c == 'o' ? "@" : was == "@" ? "@" : "+")
+                : (c == 'o' ? (was == "@" ? "" : was) : (was == "+" ? "" : was));
+            SetStatus(chan, param, now);
+
+            if (string.Equals(param, Nick, StringComparison.OrdinalIgnoreCase))
             {
                 lock (_lock)
                 {
