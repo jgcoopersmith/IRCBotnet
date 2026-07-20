@@ -89,6 +89,7 @@ public sealed class BotInfo
     public string Ident { get; set; } = "";
     public string RealName { get; set; } = "";
     public string CtcpVersion { get; set; } = "";
+    public bool AutoRejoin { get; set; }
     public BotStatus Status { get; set; }
     public List<string> Channels { get; set; } = new();          // plain names
     public List<string> ChannelsDisplay { get; set; } = new();   // with @/+ self-prefix
@@ -107,6 +108,9 @@ public sealed class BotConfig
     public string Ident { get; set; } = "";       // USER ident; empty = nick
     public string RealName { get; set; } = "";     // empty = "IRCBot <nick>"
     public string CtcpVersion { get; set; } = "Hihi!"; // reply to CTCP VERSION
+    // Rejoin a channel after being kicked, and periodically rejoin any
+    // configured channel the bot is not currently in.
+    public bool AutoRejoin { get; set; }
     public List<string> Channels { get; set; } = new();
 
     public static BotConfig FromArgs(BotRequest r) => new()
@@ -119,6 +123,7 @@ public sealed class BotConfig
         Ident = r.Arg("ident"),
         RealName = r.Arg("realname"),
         CtcpVersion = r.Args.TryGetValue("ctcpversion", out var cv) ? cv : "Hihi!",
+        AutoRejoin = r.Arg("autorejoin").Equals("true", StringComparison.OrdinalIgnoreCase),
         Channels = r.Arg("channels").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList()
     };
 }

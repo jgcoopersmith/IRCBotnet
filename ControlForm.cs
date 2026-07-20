@@ -628,6 +628,7 @@ public sealed class ControlForm : Form
             Ident = dlg.Ident,
             RealName = dlg.RealName,
             CtcpVersion = dlg.CtcpVersion,
+            AutoRejoin = dlg.AutoRejoin,
             Channels = SplitChannels(dlg.Channels)
         };
         _roster.Add(def);
@@ -658,7 +659,8 @@ public sealed class ControlForm : Form
         if (def == null) return;
 
         using var dlg = new AddBotDialog("Edit Bot", def.Nick, def.Host, def.Port.ToString(),
-            def.UseTls, def.Password, def.Ident, def.RealName, def.CtcpVersion, string.Join(", ", def.Channels));
+            def.UseTls, def.Password, def.Ident, def.RealName, def.CtcpVersion, string.Join(", ", def.Channels),
+            def.AutoRejoin);
         if (dlg.ShowDialog(this) != DialogResult.OK) return;
         if (string.IsNullOrWhiteSpace(dlg.Nick)) { Warn("Nick is required"); return; }
 
@@ -670,6 +672,7 @@ public sealed class ControlForm : Form
         def.Ident = dlg.Ident;
         def.RealName = dlg.RealName;
         def.CtcpVersion = dlg.CtcpVersion;
+        def.AutoRejoin = dlg.AutoRejoin;
         def.Channels = SplitChannels(dlg.Channels);
         SaveRoster();
         Log($"Edited bot {def.Nick} (local roster).");
@@ -783,6 +786,7 @@ public sealed class BotDef
     public string Ident { get; set; } = "";
     public string RealName { get; set; } = "";
     public string CtcpVersion { get; set; } = "Hihi!";
+    public bool AutoRejoin { get; set; }
     public List<string> Channels { get; set; } = new();
 
     public (string, string)[] ToArgs() => new[]
@@ -790,6 +794,7 @@ public sealed class BotDef
         ("id", Id), ("nick", Nick), ("host", Host), ("port", Port.ToString()),
         ("tls", UseTls ? "true" : "false"), ("password", Password),
         ("ident", Ident), ("realname", RealName), ("ctcpversion", CtcpVersion),
+        ("autorejoin", AutoRejoin ? "true" : "false"),
         ("channels", string.Join(",", Channels))
     };
 
@@ -798,6 +803,7 @@ public sealed class BotDef
         Id = b.Id, Nick = b.Nick, Host = b.Host, Port = b.Port, UseTls = b.UseTls,
         Ident = b.Ident, RealName = b.RealName,
         CtcpVersion = string.IsNullOrEmpty(b.CtcpVersion) ? "Hihi!" : b.CtcpVersion,
+        AutoRejoin = b.AutoRejoin,
         Channels = b.Channels.ToList()
     };
 }
@@ -814,6 +820,7 @@ public sealed class AddBotDialog : Form
     private readonly TextBox _real = new() { Width = 250 };
     private readonly TextBox _ctcp = new() { Width = 250 };
     private readonly TextBox _channels = new() { Width = 250 };
+    private readonly CheckBox _autoRejoin = new() { Text = "Rejoin channels if kicked or missing", AutoSize = true };
 
     public string Nick => _nick.Text.Trim();
     public string HostName => _host.Text.Trim();
@@ -824,20 +831,22 @@ public sealed class AddBotDialog : Form
     public string RealName => _real.Text.Trim();
     public string CtcpVersion => _ctcp.Text;
     public string Channels => _channels.Text.Trim();
+    public bool AutoRejoin => _autoRejoin.Checked;
 
     public AddBotDialog(string title = "Add Bot", string nick = "MyBot", string host = "localhost",
         string port = "6667", bool tls = false, string password = "", string ident = "",
-        string realName = "", string ctcpVersion = "Hihi!", string channels = "#test")
+        string realName = "", string ctcpVersion = "Hihi!", string channels = "#test",
+        bool autoRejoin = false)
     {
         Text = title;
-        Width = 420; Height = 382;
+        Width = 420; Height = 420;
         FormBorderStyle = FormBorderStyle.FixedDialog;
         StartPosition = FormStartPosition.CenterParent;
         MaximizeBox = false; MinimizeBox = false;
 
         _nick.Text = nick; _host.Text = host; _port.Text = port; _tls.Checked = tls;
         _pass.Text = password; _ident.Text = ident; _real.Text = realName;
-        _ctcp.Text = ctcpVersion; _channels.Text = channels;
+        _ctcp.Text = ctcpVersion; _channels.Text = channels; _autoRejoin.Checked = autoRejoin;
 
         int y = 14;
         Label Row(string label, Control field)
@@ -857,6 +866,7 @@ public sealed class AddBotDialog : Form
         var lReal = Row("Real name (optional):", _real);
         var lCtcp = Row("CTCP version reply:", _ctcp);
         var lChan = Row("Channels (csv):", _channels);
+        _autoRejoin.Left = 140; _autoRejoin.Top = y; y += 30;
 
         var ok = new Button { Text = "Save", DialogResult = DialogResult.OK, Left = 234, Top = y + 6, Width = 75 };
         var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Left = 315, Top = y + 6, Width = 75 };
@@ -865,7 +875,7 @@ public sealed class AddBotDialog : Form
         {
             lNick, _nick, lHost, _host, lPort, _port, _tls,
             lPass, _pass, lIdent, _ident, lReal, _real, lCtcp, _ctcp, lChan, _channels,
-            ok, cancel
+            _autoRejoin, ok, cancel
         });
         AcceptButton = ok; CancelButton = cancel;
     }

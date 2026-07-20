@@ -26,8 +26,13 @@ public sealed class IrcBot
     public string LastEvent { get; private set; } = "created";
     public DateTime? ConnectedUtc { get; private set; }
 
+    public bool AutoRejoin { get; private set; }
+
     private readonly object _lock = new();
+    // Channels the bot is configured to be in.
     private readonly HashSet<string> _channels = new(StringComparer.OrdinalIgnoreCase);
+    // Channels it is actually in right now, so AutoRejoin can spot the gap.
+    private readonly HashSet<string> _joined = new(StringComparer.OrdinalIgnoreCase);
     // This bot's own status per channel: "@" op, "+" voice, "" none.
     private readonly Dictionary<string, string> _channelPrefix = new(StringComparer.OrdinalIgnoreCase);
     // Channels for which a WHO was issued to enforce the auto list, so unrelated
@@ -66,6 +71,7 @@ public sealed class IrcBot
         Ident = cfg.Ident;
         RealName = cfg.RealName;
         CtcpVersion = cfg.CtcpVersion;
+        AutoRejoin = cfg.AutoRejoin;
         _channels.Clear();
         foreach (var c in cfg.Channels) _channels.Add(Normalize(c));
     }
@@ -85,6 +91,7 @@ public sealed class IrcBot
             {
                 Id = Id, Nick = Nick, Host = Host, Port = Port, UseTls = UseTls,
                 Ident = Ident, RealName = RealName, CtcpVersion = CtcpVersion,
+                AutoRejoin = AutoRejoin,
                 Status = Status, LastEvent = LastEvent, ConnectedUtc = ConnectedUtc,
                 Channels = _channels.ToList(),
                 ChannelsDisplay = _channels.Select(c => _channelPrefix.GetValueOrDefault(c, "") + c).ToList()
@@ -128,7 +135,7 @@ public sealed class IrcBot
             w = _writer;
             Status = BotStatus.Stopped;
             ConnectedUtc = null;
-            _channelPrefix.Clear(); _autoWhoPending.Clear(); _members.Clear();
+            _channelPrefix.Clear(); _autoWhoPending.Clear(); _members.Clear(); _joined.Clear();
         }
         Event("stopped");
         try { w?.WriteLine("QUIT :bye"); } catch { }
@@ -152,7 +159,7 @@ public sealed class IrcBot
     {
         var ch = Normalize(channel);
         bool connected;
-        lock (_lock) { _channels.Remove(ch); _channelPrefix.Remove(ch); _members.Remove(ch); connected = Status == BotStatus.Connected; }
+        lock (_lock) { _channels.Remove(ch); _joined.Remove(ch); _channelPrefix.Remove(ch); _members.Remove(ch); connected = Status == BotStatus.Connected; }
         if (connected) { Event($"PART {ch}"); Send($"PART {ch}"); }
         else Event($"PART {ch} (de-queued, not connected)");
         return connected;
@@ -272,7 +279,7 @@ public sealed class IrcBot
             lock (_lock)
             {
                 owner = ReferenceEquals(_cts, cts);
-                if (owner) { Status = BotStatus.Error; ConnectedUtc = null; _channelPrefix.Clear(); _autoWhoPending.Clear(); _members.Clear(); }
+                if (owner) { Status = BotStatus.Error; ConnectedUtc = null; _channelPrefix.Clear(); _autoWhoPending.Clear(); _members.Clear(); _joined.Clear(); }
             }
             if (owner) Event($"error: {ex.Message}");
         }
@@ -294,7 +301,7 @@ public sealed class IrcBot
             {
                 if (!wasStopped) Status = BotStatus.Stopped;
                 ConnectedUtc = null;
-                _channelPrefix.Clear(); _autoWhoPending.Clear(); _members.Clear();
+                _channelPrefix.Clear(); _autoWhoPending.Clear(); _members.Clear(); _joined.Clear();
             }
         }
         if (stillOwner && !wasStopped) Event("disconnected");
@@ -451,7 +458,11 @@ public sealed class IrcBot
         if (chan.Length == 0) return;
 
         var nick = sender.Split('!')[0];
-        if (string.Equals(nick, Nick, StringComparison.OrdinalIgnoreCase)) return; // our own join
+        if (string.Equals(nick, Nick, StringComparison.OrdinalIgnoreCase))
+        {
+            lock (_lock) _joined.Add(chan); // our own join landed
+            return;
+        }
         SetStatus(chan, nick, ""); // a joiner arrives with no status
         ApplyAuto(chan, nick, sender);
     }
@@ -567,11 +578,47 @@ public sealed class IrcBot
             while (!ct.IsCancellationRequested)
             {
                 await Task.Delay(TimeSpan.FromSeconds(60), ct);
+                RejoinMissing();
                 EnforceAll();
             }
         }
         catch (OperationCanceledException) { }
         catch { }
+    }
+
+    // Go back after a kick, with a short pause so a kick/rejoin fight with an
+    // op does not turn into a tight loop.
+    private async Task RejoinAfterKickAsync(string chan)
+    {
+        try
+        {
+            await Task.Delay(TimeSpan.FromSeconds(5));
+            bool connected;
+            lock (_lock) connected = Status == BotStatus.Connected && _channels.Contains(chan);
+            if (!connected) return;
+            Event($"auto-rejoin {chan} after kick");
+            Send($"JOIN {chan}");
+        }
+        catch { }
+    }
+
+    // JOIN any configured channel the bot is not currently in. Covers a kick
+    // whose rejoin was refused, a join that never succeeded (+i, +k, a ban that
+    // has since gone), and a channel added while disconnected.
+    public void RejoinMissing()
+    {
+        if (!AutoRejoin) return;
+        string[] missing;
+        lock (_lock)
+        {
+            if (Status != BotStatus.Connected) return;
+            missing = _channels.Where(c => !_joined.Contains(c)).ToArray();
+        }
+        foreach (var ch in missing)
+        {
+            Event($"auto-rejoin {ch} (not in channel)");
+            Send($"JOIN {ch}");
+        }
     }
 
     // Re-enforce every channel we are in (e.g. after the auto list is edited).
@@ -592,9 +639,18 @@ public sealed class IrcBot
         ForgetMember(chan, target);
         if (!string.Equals(target, Nick, StringComparison.OrdinalIgnoreCase)) return;
 
-        lock (_lock) { _channels.Remove(chan); _channelPrefix.Remove(chan); _members.Remove(chan); }
+        // With AutoRejoin the channel stays on the wanted list and we go back;
+        // without it, a kick means the bot gives the channel up.
+        lock (_lock)
+        {
+            _joined.Remove(chan);
+            _channelPrefix.Remove(chan);
+            _members.Remove(chan);
+            if (!AutoRejoin) _channels.Remove(chan);
+        }
         var reason = parts.Length > 3 ? parts[3].TrimStart(':') : "";
         Event($"kicked from {chan}" + (reason.Length > 0 ? $" ({reason})" : ""));
+        if (AutoRejoin) _ = RejoinAfterKickAsync(chan);
     }
 
     // RPL_NAMREPLY: "353 <me> = <channel> :<prefixed nicks>" — find our own prefix.
