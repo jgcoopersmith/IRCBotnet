@@ -30,6 +30,9 @@ public sealed class IrcBot
     private readonly HashSet<string> _channels = new(StringComparer.OrdinalIgnoreCase);
     // This bot's own status per channel: "@" op, "+" voice, "" none.
     private readonly Dictionary<string, string> _channelPrefix = new(StringComparer.OrdinalIgnoreCase);
+    // Channels for which a WHO was issued to enforce the auto list, so unrelated
+    // WHO replies are ignored.
+    private readonly HashSet<string> _autoWhoPending = new(StringComparer.OrdinalIgnoreCase);
     private readonly EventLog? _events;
     private readonly AutoRules? _auto;
 
@@ -122,7 +125,7 @@ public sealed class IrcBot
             w = _writer;
             Status = BotStatus.Stopped;
             ConnectedUtc = null;
-            _channelPrefix.Clear();
+            _channelPrefix.Clear(); _autoWhoPending.Clear();
         }
         Event("stopped");
         try { w?.WriteLine("QUIT :bye"); } catch { }
@@ -262,7 +265,7 @@ public sealed class IrcBot
             lock (_lock)
             {
                 owner = ReferenceEquals(_cts, cts);
-                if (owner) { Status = BotStatus.Error; ConnectedUtc = null; _channelPrefix.Clear(); }
+                if (owner) { Status = BotStatus.Error; ConnectedUtc = null; _channelPrefix.Clear(); _autoWhoPending.Clear(); }
             }
             if (owner) Event($"error: {ex.Message}");
         }
@@ -284,7 +287,7 @@ public sealed class IrcBot
             {
                 if (!wasStopped) Status = BotStatus.Stopped;
                 ConnectedUtc = null;
-                _channelPrefix.Clear();
+                _channelPrefix.Clear(); _autoWhoPending.Clear();
             }
         }
         if (stillOwner && !wasStopped) Event("disconnected");
@@ -370,6 +373,8 @@ public sealed class IrcBot
         else if (cmd == "MODE") HandleModeLine(body); // track op/voice changes to us
         else if (cmd == "KICK") HandleKickLine(body); // leave a channel we were kicked from
         else if (cmd == "JOIN") HandleJoinLine(sender, body); // enforce the auto list
+        else if (cmd == "352") HandleWhoReply(body);   // RPL_WHOREPLY → enforce on current members
+        else if (cmd == "315") HandleEndOfWho(body);   // RPL_ENDOFWHO → stop enforcing this WHO
         // Error replies occupy 400–599. A rejected MODE or KICK is only ever
         // reported this way, so surface it rather than dropping it silently.
         else if (int.TryParse(cmd, out var numeric) && numeric is >= 400 and <= 599)
@@ -395,6 +400,32 @@ public sealed class IrcBot
               + (text.Length > 0 ? $": {text}" : ""));
     }
 
+    // RPL_WHOREPLY: "352 <me> <channel> <user> <host> <server> <nick> <flags> :<hop> <real>"
+    // Only acts for channels we asked about for auto-enforcement.
+    private void HandleWhoReply(string body)
+    {
+        var p = body.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (p.Length < 8) return;
+        var chan = p[2];
+        lock (_lock) if (!_autoWhoPending.Contains(chan)) return;
+
+        var user = p[3];
+        var host = p[4];
+        var nick = p[6];
+        var whoFlags = p[7]; // e.g. "H", "H@", "G+"
+        if (string.Equals(nick, Nick, StringComparison.OrdinalIgnoreCase)) return;
+
+        var current = whoFlags.Contains('@') ? "@" : whoFlags.Contains('+') ? "+" : "";
+        ApplyAuto(chan, nick, $"{nick}!{user}@{host}", current);
+    }
+
+    // RPL_ENDOFWHO: "315 <me> <mask> :End of /WHO list."
+    private void HandleEndOfWho(string body)
+    {
+        var p = body.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (p.Length >= 3) lock (_lock) _autoWhoPending.Remove(p[2]);
+    }
+
     // ":<nick>!<user>@<host> JOIN <channel>" — apply any matching auto rules.
     // Only a bot that currently holds op can act, so in a channel with several
     // bots the opped ones will each issue the same change; a redundant +o or +v
@@ -410,30 +441,59 @@ public sealed class IrcBot
 
         var nick = sender.Split('!')[0];
         if (string.Equals(nick, Nick, StringComparison.OrdinalIgnoreCase)) return; // our own join
+        ApplyAuto(chan, nick, sender, "");
+    }
 
+    // Apply the auto list to one user. prefix is their nick!user@host; current
+    // is their existing channel status ("@", "+" or "") so we don't re-grant it.
+    // Only an opped bot may act. Kick wins over status, op over voice.
+    private void ApplyAuto(string chan, string nick, string prefix, string current)
+    {
+        if (_auto == null) return;
         bool isOp;
         lock (_lock) isOp = _channelPrefix.GetValueOrDefault(chan, "") == "@";
         if (!isOp) return;
 
-        var flags = _auto.FlagsFor(sender, chan);
+        var flags = _auto.FlagsFor(prefix, chan);
         if (flags.Length == 0) return;
 
-        // Kick wins over granting status, and op wins over voice.
         if (flags.Contains('k'))
         {
             Event($"auto-kick {nick} from {chan}");
             Send($"KICK {chan} {nick} :auto-kick");
         }
-        else if (flags.Contains('o'))
+        else if (flags.Contains('o') && current != "@")
         {
             Event($"auto-op {nick} in {chan}");
             Send($"MODE {chan} +o {nick}");
         }
-        else if (flags.Contains('v'))
+        else if (flags.Contains('v') && current != "@" && current != "+")
         {
             Event($"auto-voice {nick} in {chan}");
             Send($"MODE {chan} +v {nick}");
         }
+    }
+
+    // Enforce the auto list against everyone already in a channel by asking the
+    // server who is there (WHO → 352). Only meaningful once we hold op.
+    public void EnforceChannel(string channel)
+    {
+        var ch = Normalize(channel);
+        bool go;
+        lock (_lock)
+        {
+            go = Status == BotStatus.Connected && _channelPrefix.GetValueOrDefault(ch, "") == "@";
+            if (go) _autoWhoPending.Add(ch);
+        }
+        if (go) Send($"WHO {ch}");
+    }
+
+    // Re-enforce every channel we are in (e.g. after the auto list is edited).
+    public void EnforceAll()
+    {
+        string[] chans;
+        lock (_lock) chans = _channels.ToArray();
+        foreach (var ch in chans) EnforceChannel(ch);
     }
 
     // "KICK <channel> <target> [:<reason>]" — if we're the target, leave the channel.
@@ -467,6 +527,8 @@ public sealed class IrcBot
             if (string.Equals(name, Nick, StringComparison.OrdinalIgnoreCase))
             {
                 lock (_lock) if (_channels.Contains(chan)) _channelPrefix[chan] = prefix;
+                // Already opped on join → enforce the auto list on who's here.
+                if (prefix == "@") EnforceChannel(chan);
                 break;
             }
         }
@@ -484,6 +546,7 @@ public sealed class IrcBot
         var args = parts.Skip(3).ToArray();
         int argIdx = 0;
         char sign = '+';
+        bool gainedOp = false;
         foreach (var c in flags)
         {
             if (c is '+' or '-') { sign = c; continue; }
@@ -493,11 +556,13 @@ public sealed class IrcBot
                 lock (_lock)
                 {
                     var cur = _channelPrefix.GetValueOrDefault(chan, "");
-                    if (sign == '+') { if (c == 'o') _channelPrefix[chan] = "@"; else if (cur != "@") _channelPrefix[chan] = "+"; }
+                    if (sign == '+') { if (c == 'o') { _channelPrefix[chan] = "@"; gainedOp = true; } else if (cur != "@") _channelPrefix[chan] = "+"; }
                     else { if (c == 'o' && cur == "@") _channelPrefix[chan] = ""; else if (c == 'v' && cur == "+") _channelPrefix[chan] = ""; }
                 }
             }
         }
+        // Just got op → apply the auto list to everyone already in the channel.
+        if (gainedOp) EnforceChannel(chan);
     }
 
     // Handle incoming PRIVMSG: surface messages and CTCP in the activity log,

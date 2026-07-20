@@ -52,12 +52,32 @@ public sealed class AutoRules
         return flags;
     }
 
-    // IRC-style glob: '*' spans any run, '?' one character, case-insensitive.
+    // Match a mask against a full "nick!user@host". A full nick!user@host mask
+    // matches the whole thing; the common shorthands are also accepted so a rule
+    // reads the way people actually write it:
+    //   user@host  → matched against the user@host part (nick ignored)
+    //   nick       → matched against the nick alone
     public static bool MaskMatches(string mask, string target)
     {
         if (string.IsNullOrEmpty(mask)) return false;
+        if (Glob(mask, target)) return true;
+        if (mask.Contains('!')) return false; // a full mask must match in full
+
+        int bang = target.IndexOf('!');
+        if (mask.Contains('@'))
+        {
+            var userHost = bang >= 0 ? target[(bang + 1)..] : target;
+            return Glob(mask, userHost);
+        }
+        var nick = bang >= 0 ? target[..bang] : target;
+        return Glob(mask, nick);
+    }
+
+    // IRC-style glob: '*' spans any run, '?' one character, case-insensitive.
+    private static bool Glob(string mask, string value)
+    {
         var pattern = "^" + Regex.Escape(mask).Replace("\\*", ".*").Replace("\\?", ".") + "$";
-        try { return Regex.IsMatch(target, pattern, RegexOptions.IgnoreCase); }
+        try { return Regex.IsMatch(value, pattern, RegexOptions.IgnoreCase); }
         catch { return false; }
     }
 

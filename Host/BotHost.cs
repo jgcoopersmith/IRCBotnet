@@ -70,6 +70,10 @@ public sealed class BotHost
 
     public void StopAll() { foreach (var b in _bots.Values) b.Stop(); }
 
+    // Re-apply the auto list to everyone currently in the bots' channels.
+    // Called after the list is edited so a new rule takes effect immediately.
+    public void EnforceAuto() { foreach (var b in _bots.Values) b.EnforceAll(); }
+
     private bool With(string id, Action<IrcBot> action)
     {
         if (_bots.TryGetValue(id, out var bot)) { action(bot); return true; }

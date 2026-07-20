@@ -157,6 +157,7 @@ public sealed class ControlInterface(BotHost host, int port, string? password)
                     ? new List<AutoEntry>()
                     : ControlJson.Deserialize<List<AutoEntry>>(json) ?? new List<AutoEntry>();
                 host.Auto.Replace(entries);
+                host.EnforceAuto(); // apply immediately to users already present
                 return new BotResponse { Ok = true, Message = $"Auto list saved ({entries.Count})", AutoEntries = host.Auto.All() };
             }
 
