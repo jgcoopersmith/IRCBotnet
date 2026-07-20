@@ -248,6 +248,10 @@ public sealed class IrcBot
             Send($"NICK {Nick}");
             Send($"USER {ident} 0 * :{real}");
 
+            // Periodically re-apply the auto list, so a rule catches up with
+            // anyone the join-time and save-time passes missed.
+            _ = PeriodicEnforceAsync(ct);
+
             while (!ct.IsCancellationRequested)
             {
                 var line = await reader.ReadLineAsync(ct);
@@ -486,6 +490,23 @@ public sealed class IrcBot
             if (go) _autoWhoPending.Add(ch);
         }
         if (go) Send($"WHO {ch}");
+    }
+
+    // Sweep the auto list across every channel once a minute for the life of
+    // the connection. EnforceAll is a no-op where we lack op or the list is
+    // empty, so an idle sweep costs one WHO per opped channel.
+    private async Task PeriodicEnforceAsync(CancellationToken ct)
+    {
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(60), ct);
+                EnforceAll();
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch { }
     }
 
     // Re-enforce every channel we are in (e.g. after the auto list is edited).
