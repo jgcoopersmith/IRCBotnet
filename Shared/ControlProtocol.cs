@@ -22,6 +22,22 @@ public static class BotCommands
     public const string Kick    = "KICK";    // args: id, channel, nick, reason
     public const string BanList = "BANLIST"; // args: id, channel -> ChannelBans (and refreshes cache)
     public const string Events  = "EVENTS";  // args: since (cursor) -> Events, Cursor
+    public const string AutoList = "AUTOLIST"; // -> AutoEntries
+    public const string AutoSet  = "AUTOSET";  // args: entries (JSON array) -> AutoEntries
+}
+
+// One rule in the auto list: when a user matching Mask joins Channel, the bots
+// apply Flags to them. The host owns this list and enforces it; the panel edits it.
+public sealed class AutoEntry
+{
+    // nick!user@host, with * and ? wildcards (e.g. "*!*@*.comcast.net")
+    public string Mask { get; set; } = "";
+    // Channel the rule applies in; "*" means every channel the bot is in.
+    public string Channel { get; set; } = "*";
+    // Any of: o (auto-op), v (auto-voice), k (auto-kick).
+    public string Flags { get; set; } = "";
+
+    public bool Has(char f) => Flags.Contains(f, StringComparison.OrdinalIgnoreCase);
 }
 
 public enum BotStatus { Stopped, Connecting, Connected, Error }
@@ -42,6 +58,7 @@ public sealed class BotResponse
     public List<BotEvent>? Events { get; set; }
     public long Cursor { get; set; }
     public List<ChannelBan>? ChannelBans { get; set; }
+    public List<AutoEntry>? AutoEntries { get; set; }
 }
 
 // A +b entry on a channel, as reported by the server (RPL_BANLIST / 367).

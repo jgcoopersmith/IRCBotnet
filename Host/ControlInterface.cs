@@ -147,6 +147,19 @@ public sealed class ControlInterface(BotHost host, int port, string? password)
                 return ok ? new BotResponse { Ok = true, ChannelBans = bans } : Fail("No such bot");
             }
 
+            case BotCommands.AutoList:
+                return new BotResponse { Ok = true, AutoEntries = host.Auto.All() };
+
+            case BotCommands.AutoSet:
+            {
+                var json = req.Arg("entries");
+                var entries = string.IsNullOrWhiteSpace(json)
+                    ? new List<AutoEntry>()
+                    : ControlJson.Deserialize<List<AutoEntry>>(json) ?? new List<AutoEntry>();
+                host.Auto.Replace(entries);
+                return new BotResponse { Ok = true, Message = $"Auto list saved ({entries.Count})", AutoEntries = host.Auto.All() };
+            }
+
             case BotCommands.Events:
             {
                 long since = long.TryParse(req.Arg("since"), out var c) ? c : 0;

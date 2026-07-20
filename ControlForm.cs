@@ -132,7 +132,7 @@ public sealed class ControlForm : Form
         var split = _mainSplit;
 
         var botsPanel = new Panel { Dock = DockStyle.Fill };
-        var actions = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 96, WrapContents = true };
+        var actions = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 132, WrapContents = true };
 
         // Row 1 — bot lifecycle and messaging
         AddButton(actions, "☑ All", () => { SetAllChecked(true); return Task.CompletedTask; });
@@ -155,7 +155,11 @@ public sealed class ControlForm : Form
         AddButton(actions, "Voice", async () => await MemberModeAsync("+v"));
         AddButton(actions, "Devoice", async () => await MemberModeAsync("-v"));
         AddButton(actions, "Kick…", async () => await KickAsync());
-        AddButton(actions, "Bans…", async () => await ManageBansAsync());
+        var bansBtn = AddButton(actions, "Bans…", async () => await ManageBansAsync());
+        actions.SetFlowBreak(bansBtn, true); // start the automation row
+
+        // Row 3 — standing automation the host enforces on its own
+        AddButton(actions, "Auto…", async () => await ManageAutoAsync());
 
         botsPanel.Controls.Add(_botsView);
         botsPanel.Controls.Add(actions);
@@ -581,6 +585,17 @@ public sealed class ControlForm : Form
         await RunBatch(BotCommands.Kick, ("channel", channel), ("nick", nick), ("reason", reason));
     }
 
+    // Edit the standing auto list. The host owns and enforces it, so this needs
+    // a connection but no particular bot selected.
+    private async Task ManageAutoAsync()
+    {
+        if (!_client.IsConnected) { Warn("Connect to a bot host first"); return; }
+        using var dlg = new AutoListDialog(_client);
+        dlg.ShowDialog(this);
+        Log("Auto list closed");
+        await Task.CompletedTask;
+    }
+
     // View / add / remove channel bans through one bot's eyes.
     private async Task ManageBansAsync()
     {
@@ -957,5 +972,151 @@ public sealed class BanManagerDialog : Form
         dlg.Controls.AddRange(new Control[] { lbl, box, ok, cancel });
         dlg.AcceptButton = ok; dlg.CancelButton = cancel;
         return dlg.ShowDialog(this) == DialogResult.OK ? box.Text.Trim() : null;
+    }
+}
+
+// Editor for the host's auto list: hostmask rules the bots enforce when a
+// matching user joins (+o auto-op, +v auto-voice, +k auto-kick). The whole
+// list is pushed back to the host on save, mirroring how the roster syncs.
+public sealed class AutoListDialog : Form
+{
+    private readonly BotControlClient _client;
+    private readonly ListView _list;
+    private readonly Label _status;
+    private List<AutoEntry> _entries = new();
+
+    public AutoListDialog(BotControlClient client)
+    {
+        _client = client;
+
+        Text = "Auto list — enforced by the bots on join";
+        Width = 620; Height = 440;
+        StartPosition = FormStartPosition.CenterParent;
+        MinimizeBox = false; MaximizeBox = false;
+
+        _list = new ListView
+        {
+            Left = 12, Top = 12, Width = 584, Height = 300,
+            Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom,
+            View = View.Details, FullRowSelect = true, GridLines = true, MultiSelect = false
+        };
+        _list.Columns.Add("Hostmask", 300);
+        _list.Columns.Add("Channel", 130);
+        _list.Columns.Add("Flags", 140);
+
+        var addBtn    = new Button { Text = "Add…",   Left = 12,  Top = 322, Width = 80, Anchor = AnchorStyles.Bottom | AnchorStyles.Left };
+        var editBtn   = new Button { Text = "Edit…",  Left = 98,  Top = 322, Width = 80, Anchor = AnchorStyles.Bottom | AnchorStyles.Left };
+        var removeBtn = new Button { Text = "Remove", Left = 184, Top = 322, Width = 80, Anchor = AnchorStyles.Bottom | AnchorStyles.Left };
+        var saveBtn   = new Button { Text = "Save",   Left = 430, Top = 322, Width = 80, Anchor = AnchorStyles.Bottom | AnchorStyles.Right };
+        var closeBtn  = new Button { Text = "Close", DialogResult = DialogResult.Cancel, Left = 516, Top = 322, Width = 80, Anchor = AnchorStyles.Bottom | AnchorStyles.Right };
+
+        _status = new Label { Left = 12, Top = 356, Width = 400, Anchor = AnchorStyles.Bottom | AnchorStyles.Left, Text = "" };
+
+        addBtn.Click    += (_, _) => EditEntry(null);
+        editBtn.Click   += (_, _) => { if (Selected() is { } e) EditEntry(e); };
+        removeBtn.Click += (_, _) => { if (Selected() is { } e) { _entries.Remove(e); Render(); } };
+        saveBtn.Click   += async (_, _) => await SaveAsync();
+        _list.DoubleClick += (_, _) => { if (Selected() is { } e) EditEntry(e); };
+
+        Controls.AddRange(new Control[]
+        {
+            _list, addBtn, editBtn, removeBtn, saveBtn, closeBtn, _status,
+            new Label
+            {
+                Left = 12, Top = 380, Width = 584, Anchor = AnchorStyles.Bottom | AnchorStyles.Left,
+                Text = "Masks use * and ? wildcards, e.g. *!*@*.comcast.net. Channel * means every channel."
+            }
+        });
+        CancelButton = closeBtn;
+        Load += async (_, _) => await LoadAsync();
+    }
+
+    private AutoEntry? Selected() =>
+        _list.SelectedItems.Count == 0 ? null : _list.SelectedItems[0].Tag as AutoEntry;
+
+    private async Task LoadAsync()
+    {
+        try
+        {
+            var r = await _client.ActionAsync(BotCommands.AutoList);
+            _entries = r.AutoEntries ?? new List<AutoEntry>();
+            Render();
+            _status.Text = $"{_entries.Count} rule(s) loaded from the host.";
+        }
+        catch (Exception ex) { _status.Text = "Load failed: " + ex.Message; }
+    }
+
+    private async Task SaveAsync()
+    {
+        try
+        {
+            var json = ControlJson.Serialize(_entries);
+            var r = await _client.ActionAsync(BotCommands.AutoSet, ("entries", json));
+            if (r.Ok)
+            {
+                _entries = r.AutoEntries ?? _entries;
+                Render();
+                _status.Text = r.Message ?? "Saved.";
+            }
+            else _status.Text = "Save failed: " + r.Error;
+        }
+        catch (Exception ex) { _status.Text = "Save failed: " + ex.Message; }
+    }
+
+    private void Render()
+    {
+        _list.BeginUpdate();
+        _list.Items.Clear();
+        foreach (var e in _entries)
+        {
+            var flags = string.Join(", ", new[]
+            {
+                e.Has('o') ? "+o op" : null,
+                e.Has('v') ? "+v voice" : null,
+                e.Has('k') ? "+k kick" : null
+            }.Where(s => s != null));
+            _list.Items.Add(new ListViewItem(new[] { e.Mask, e.Channel, flags }) { Tag = e });
+        }
+        _list.EndUpdate();
+    }
+
+    // Add (existing == null) or edit one rule in place.
+    private void EditEntry(AutoEntry? existing)
+    {
+        using var dlg = new Form
+        {
+            Text = existing == null ? "Add auto rule" : "Edit auto rule",
+            Width = 420, Height = 250, StartPosition = FormStartPosition.CenterParent,
+            FormBorderStyle = FormBorderStyle.FixedDialog, MinimizeBox = false, MaximizeBox = false
+        };
+        var mask = new TextBox { Left = 110, Top = 16, Width = 270, Text = existing?.Mask ?? "*!*@" };
+        var chan = new TextBox { Left = 110, Top = 48, Width = 270, Text = existing?.Channel ?? "*" };
+        var op    = new CheckBox { Left = 110, Top = 80,  Width = 260, Text = "+o  auto-op on join",    Checked = existing?.Has('o') ?? false };
+        var voice = new CheckBox { Left = 110, Top = 104, Width = 260, Text = "+v  auto-voice on join", Checked = existing?.Has('v') ?? false };
+        var kick  = new CheckBox { Left = 110, Top = 128, Width = 260, Text = "+k  auto-kick on join",  Checked = existing?.Has('k') ?? false };
+        var ok     = new Button { Text = "OK", DialogResult = DialogResult.OK, Left = 214, Top = 162, Width = 80 };
+        var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Left = 300, Top = 162, Width = 80 };
+
+        dlg.Controls.AddRange(new Control[]
+        {
+            new Label { Text = "Hostmask:", Left = 16, Top = 19, Width = 90 }, mask,
+            new Label { Text = "Channel:",  Left = 16, Top = 51, Width = 90 }, chan,
+            op, voice, kick, ok, cancel
+        });
+        dlg.AcceptButton = ok; dlg.CancelButton = cancel;
+        if (dlg.ShowDialog(this) != DialogResult.OK) return;
+
+        var m = mask.Text.Trim();
+        if (m.Length == 0) { _status.Text = "A hostmask is required."; return; }
+        var flags = (op.Checked ? "o" : "") + (voice.Checked ? "v" : "") + (kick.Checked ? "k" : "");
+        if (flags.Length == 0) { _status.Text = "Pick at least one flag."; return; }
+
+        var target = existing ?? new AutoEntry();
+        target.Mask = m;
+        target.Channel = chan.Text.Trim() is { Length: > 0 } c ? c : "*";
+        target.Flags = flags;
+        if (existing == null) _entries.Add(target);
+        Render();
+        _status.Text = "Edited — press Save to push this to the host.";
     }
 }

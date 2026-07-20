@@ -11,6 +11,9 @@ public sealed class BotHost
     // Shared, ordered log of bot activity that the panel streams via EVENTS.
     public EventLog Events { get; } = new();
 
+    // Hostmask rules every bot enforces on join.
+    public AutoRules Auto { get; } = new();
+
     public IReadOnlyCollection<BotInfo> List() => _bots.Values.Select(b => b.ToInfo()).ToList();
 
     // Create a bot, or update it if the id already exists (idempotent so the
@@ -24,7 +27,7 @@ public sealed class BotHost
                 ? (true, "Bot updated")
                 : (false, "Bot is running — stop it before editing");
         }
-        _bots[id] = new IrcBot(id, cfg, Events);
+        _bots[id] = new IrcBot(id, cfg, Events, Auto);
         return (true, "Bot added");
     }
 

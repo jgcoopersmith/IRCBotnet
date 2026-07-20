@@ -31,6 +31,7 @@ public sealed class IrcBot
     // This bot's own status per channel: "@" op, "+" voice, "" none.
     private readonly Dictionary<string, string> _channelPrefix = new(StringComparer.OrdinalIgnoreCase);
     private readonly EventLog? _events;
+    private readonly AutoRules? _auto;
 
     // Channel ban lists captured from the server's 367/368 replies.
     private readonly Dictionary<string, List<ChannelBan>> _banCache = new(StringComparer.OrdinalIgnoreCase);
@@ -40,10 +41,11 @@ public sealed class IrcBot
     private StreamWriter? _writer;
     private CancellationTokenSource? _cts;
 
-    public IrcBot(string id, BotConfig cfg, EventLog? events = null)
+    public IrcBot(string id, BotConfig cfg, EventLog? events = null, AutoRules? auto = null)
     {
         Id = id;
         _events = events;
+        _auto = auto;
         Apply(cfg);
         Event("created");
     }
@@ -367,6 +369,7 @@ public sealed class IrcBot
         else if (cmd == "353") HandleNames(body);   // RPL_NAMREPLY → learn our own prefix
         else if (cmd == "MODE") HandleModeLine(body); // track op/voice changes to us
         else if (cmd == "KICK") HandleKickLine(body); // leave a channel we were kicked from
+        else if (cmd == "JOIN") HandleJoinLine(sender, body); // enforce the auto list
         // Error replies occupy 400–599. A rejected MODE or KICK is only ever
         // reported this way, so surface it rather than dropping it silently.
         else if (int.TryParse(cmd, out var numeric) && numeric is >= 400 and <= 599)
@@ -390,6 +393,47 @@ public sealed class IrcBot
         Event($"server error {numeric}"
               + (context.Length > 0 ? $" ({context})" : "")
               + (text.Length > 0 ? $": {text}" : ""));
+    }
+
+    // ":<nick>!<user>@<host> JOIN <channel>" — apply any matching auto rules.
+    // Only a bot that currently holds op can act, so in a channel with several
+    // bots the opped ones will each issue the same change; a redundant +o or +v
+    // is harmless, and a second KICK simply finds the user already gone.
+    private void HandleJoinLine(string? sender, string body)
+    {
+        if (_auto == null || string.IsNullOrEmpty(sender)) return;
+
+        var parts = body.Split(' ', 2);
+        if (parts.Length < 2) return;
+        var chan = parts[1].TrimStart(':').Trim();
+        if (chan.Length == 0) return;
+
+        var nick = sender.Split('!')[0];
+        if (string.Equals(nick, Nick, StringComparison.OrdinalIgnoreCase)) return; // our own join
+
+        bool isOp;
+        lock (_lock) isOp = _channelPrefix.GetValueOrDefault(chan, "") == "@";
+        if (!isOp) return;
+
+        var flags = _auto.FlagsFor(sender, chan);
+        if (flags.Length == 0) return;
+
+        // Kick wins over granting status, and op wins over voice.
+        if (flags.Contains('k'))
+        {
+            Event($"auto-kick {nick} from {chan}");
+            Send($"KICK {chan} {nick} :auto-kick");
+        }
+        else if (flags.Contains('o'))
+        {
+            Event($"auto-op {nick} in {chan}");
+            Send($"MODE {chan} +o {nick}");
+        }
+        else if (flags.Contains('v'))
+        {
+            Event($"auto-voice {nick} in {chan}");
+            Send($"MODE {chan} +v {nick}");
+        }
     }
 
     // "KICK <channel> <target> [:<reason>]" — if we're the target, leave the channel.
