@@ -38,9 +38,16 @@ public sealed class IrcBot
     // Channels for which a WHO was issued to enforce the auto list, so unrelated
     // WHO replies are ignored.
     private readonly HashSet<string> _autoWhoPending = new(StringComparer.OrdinalIgnoreCase);
-    // Everyone in each channel and their status ("@" op, "+" voice, "" none), so
-    // a rule is only acted on when it would actually change something.
-    private readonly Dictionary<string, Dictionary<string, string>> _members = new(StringComparer.OrdinalIgnoreCase);
+    // Everyone in each channel: their status ("@" op, "+" voice, "" none) so a
+    // rule is only acted on when it would change something, and their
+    // nick!user@host where known, so a MODE line — which names only the nick —
+    // can still be matched against the auto list.
+    private sealed class Member
+    {
+        public string Status = "";
+        public string Prefix = "";
+    }
+    private readonly Dictionary<string, Dictionary<string, Member>> _members = new(StringComparer.OrdinalIgnoreCase);
     private readonly EventLog? _events;
     private readonly AutoRules? _auto;
 
@@ -432,9 +439,12 @@ public sealed class IrcBot
         var whoFlags = p[7]; // e.g. "H", "H@", "G+"
         if (string.Equals(nick, Nick, StringComparison.OrdinalIgnoreCase)) return;
 
-        // WHO is authoritative for who holds what right now.
+        // WHO is authoritative for who holds what right now, and is where we
+        // learn most hostmasks.
+        var prefix = $"{nick}!{user}@{host}";
         SetStatus(chan, nick, whoFlags.Contains('@') ? "@" : whoFlags.Contains('+') ? "+" : "");
-        ApplyAuto(chan, nick, $"{nick}!{user}@{host}");
+        SetPrefix(chan, nick, prefix);
+        ApplyAuto(chan, nick, prefix);
     }
 
     // RPL_ENDOFWHO: "315 <me> <mask> :End of /WHO list."
@@ -464,24 +474,39 @@ public sealed class IrcBot
             return;
         }
         SetStatus(chan, nick, ""); // a joiner arrives with no status
+        SetPrefix(chan, nick, sender);
         ApplyAuto(chan, nick, sender);
     }
 
     // Membership bookkeeping. Callers already hold no lock; these take it.
+    private Member Entry(string chan, string nick) // call under _lock
+    {
+        if (!_members.TryGetValue(chan, out var m))
+            m = _members[chan] = new Dictionary<string, Member>(StringComparer.OrdinalIgnoreCase);
+        if (!m.TryGetValue(nick, out var e)) m[nick] = e = new Member();
+        return e;
+    }
+
     private string StatusOf(string chan, string nick)
     {
         lock (_lock)
-            return _members.TryGetValue(chan, out var m) && m.TryGetValue(nick, out var s) ? s : "";
+            return _members.TryGetValue(chan, out var m) && m.TryGetValue(nick, out var e) ? e.Status : "";
+    }
+
+    private string PrefixOf(string chan, string nick)
+    {
+        lock (_lock)
+            return _members.TryGetValue(chan, out var m) && m.TryGetValue(nick, out var e) ? e.Prefix : "";
     }
 
     private void SetStatus(string chan, string nick, string status)
     {
-        lock (_lock)
-        {
-            if (!_members.TryGetValue(chan, out var m))
-                m = _members[chan] = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-            m[nick] = status;
-        }
+        lock (_lock) Entry(chan, nick).Status = status;
+    }
+
+    private void SetPrefix(string chan, string nick, string prefix)
+    {
+        lock (_lock) Entry(chan, nick).Prefix = prefix;
     }
 
     private void ForgetMember(string chan, string nick)
@@ -498,7 +523,13 @@ public sealed class IrcBot
     {
         lock (_lock)
             foreach (var m in _members.Values)
-                if (m.Remove(oldNick, out var status)) m[newNick] = status;
+                if (m.Remove(oldNick, out var e))
+                {
+                    // The hostmask survives a rename, only the nick part changes.
+                    int at = e.Prefix.IndexOf('!');
+                    if (at >= 0) e.Prefix = newNick + e.Prefix[at..];
+                    m[newNick] = e;
+                }
     }
 
     // ":<nick>!… PART <channel>" — drop them from the membership record.
@@ -693,6 +724,7 @@ public sealed class IrcBot
         int argIdx = 0;
         char sign = '+';
         bool gainedOp = false;
+        var touched = new List<string>(); // users whose status someone just changed
         foreach (var c in flags)
         {
             if (c is '+' or '-') { sign = c; continue; }
@@ -706,6 +738,7 @@ public sealed class IrcBot
                 ? (c == 'o' ? "@" : was == "@" ? "@" : "+")
                 : (c == 'o' ? (was == "@" ? "" : was) : (was == "+" ? "" : was));
             SetStatus(chan, param, now);
+            if (now != was) touched.Add(param);
 
             if (string.Equals(param, Nick, StringComparison.OrdinalIgnoreCase))
             {
@@ -718,7 +751,19 @@ public sealed class IrcBot
             }
         }
         // Just got op → apply the auto list to everyone already in the channel.
-        if (gainedOp) EnforceChannel(chan);
+        if (gainedOp) { EnforceChannel(chan); return; }
+
+        // Someone changed a user's status: if the auto list says otherwise, put
+        // it back. ApplyAuto no-ops for users no rule covers, and for changes
+        // that already agree with the list, so a normal op/deop is untouched.
+        foreach (var nick in touched)
+        {
+            if (string.Equals(nick, Nick, StringComparison.OrdinalIgnoreCase)) continue;
+            var prefix = PrefixOf(chan, nick);
+            if (prefix.Length > 0) ApplyAuto(chan, nick, prefix);
+            // Hostmask not learned yet — a WHO fills it in and enforces there.
+            else EnforceChannel(chan);
+        }
     }
 
     // Handle incoming PRIVMSG: surface messages and CTCP in the activity log,
