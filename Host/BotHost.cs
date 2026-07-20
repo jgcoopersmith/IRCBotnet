@@ -11,8 +11,11 @@ public sealed class BotHost
     // Shared, ordered log of bot activity that the panel streams via EVENTS.
     public EventLog Events { get; } = new();
 
-    // Hostmask rules every bot enforces on join.
-    public AutoRules Auto { get; } = new();
+    // Hostmask rules every bot enforces on join. Scoped to the control port so
+    // separate hosts do not share one file.
+    public AutoRules Auto { get; }
+
+    public BotHost(int controlPort = 6690) => Auto = new AutoRules(controlPort);
 
     public IReadOnlyCollection<BotInfo> List() => _bots.Values.Select(b => b.ToInfo()).ToList();
 

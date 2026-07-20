@@ -11,11 +11,20 @@ public sealed class AutoRules
 {
     private readonly object _lock = new();
     private List<AutoEntry> _entries = new();
+    private readonly string _storePath;
 
-    private static string StorePath => Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "IRCBot", "auto.json");
+    private static string Dir => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "IRCBot");
 
-    public AutoRules() => Load();
+    // Per-port file so two hosts on one account keep separate lists. The old
+    // unversioned "auto.json" is migrated in on first load.
+    private static string LegacyPath => Path.Combine(Dir, "auto.json");
+
+    public AutoRules(int controlPort = 6690)
+    {
+        _storePath = Path.Combine(Dir, $"auto-{controlPort}.json");
+        Load();
+    }
 
     public List<AutoEntry> All()
     {
@@ -92,8 +101,13 @@ public sealed class AutoRules
     {
         try
         {
-            if (!File.Exists(StorePath)) return;
-            var list = JsonSerializer.Deserialize<List<AutoEntry>>(File.ReadAllText(StorePath));
+            // Prefer this host's own file; fall back to the legacy shared file so
+            // an existing list carries over on the first run after this change.
+            var path = File.Exists(_storePath) ? _storePath
+                     : File.Exists(LegacyPath) ? LegacyPath
+                     : null;
+            if (path == null) return;
+            var list = JsonSerializer.Deserialize<List<AutoEntry>>(File.ReadAllText(path));
             if (list != null) lock (_lock) _entries = list.Select(Copy).ToList();
         }
         catch { /* a corrupt or unreadable store must not stop the host */ }
@@ -103,10 +117,10 @@ public sealed class AutoRules
     {
         try
         {
-            Directory.CreateDirectory(Path.GetDirectoryName(StorePath)!);
+            Directory.CreateDirectory(Path.GetDirectoryName(_storePath)!);
             List<AutoEntry> snapshot;
             lock (_lock) snapshot = _entries.Select(Copy).ToList();
-            File.WriteAllText(StorePath, JsonSerializer.Serialize(snapshot, new JsonSerializerOptions { WriteIndented = true }));
+            File.WriteAllText(_storePath, JsonSerializer.Serialize(snapshot, new JsonSerializerOptions { WriteIndented = true }));
         }
         catch { }
     }
